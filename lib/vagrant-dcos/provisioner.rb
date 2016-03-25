@@ -70,7 +70,7 @@ module VagrantPlugins
         boot_public_address = @machine.provider.capability(:public_address)
         gen_conf_config.exhibitor_zk_hosts = "#{boot_public_address}:2181"
         case install_method
-        when :ssh_push
+        when :ssh_push, :web
           #TODO: in the future this may not be required by genconf, since it's really an internal concern
           gen_conf_config.bootstrap_url = 'file:///opt/dcos_install_tmp'
         when :ssh_pull
@@ -86,15 +86,26 @@ module VagrantPlugins
           gen_conf_config.resolvers = [ '8.8.8.8' ]
         end
 
+        @machine.ui.success 'Generating Configuration: ~/dcos/genconf/config.yaml'
         write_gen_conf_config(gen_conf_config)
 
+        @machine.ui.success 'Generating IP Detection Script: ~/dcos/genconf/ip-detect'
         master_ip = gen_conf_config.master_list.first
         write_ip_detect(master_ip)
 
-        @machine.ui.info 'Importing ~/dcos/genconf/ssh_key'
+        @machine.ui.success 'Importing Private SSH Key: ~/dcos/genconf/ssh_key'
         sudo('cp /vagrant/.vagrant/dcos/private_key_vagrant ~/dcos/genconf/ssh_key')
-        #sudo('cat ~/dcos/genconf/ssh_key')
 
+        if install_method == :web
+          # Move config files to the /vagrant mount so the user can reference/upload them to the web ui
+          sudo('mv ~/dcos/genconf/config.yaml /vagrant/config.yaml')
+          sudo('mv ~/dcos/genconf/ip-detect /vagrant/ip-detect')
+          @machine.ui.success "Starting Web Installer: http://#{@machine.config.hostname}:9000"
+          install_web
+          return
+        end
+
+        @machine.ui.success 'Generating DCOS Installer Files: ~/dcos/genconf/serve/'
         sudo('cd ~/dcos && bash ~/dcos/dcos_generate_config.sh --genconf && cp -rpv ~/dcos/genconf/serve/* /var/tmp/dcos/')
 
         case install_method
@@ -107,6 +118,10 @@ module VagrantPlugins
 
       def filter_machines(active_machines, machine_types, type)
         active_machines.select{ |name, _provider| machine_types[name.to_s]['type'] == type }
+      end
+
+      def install_web
+        sudo('cd ~/dcos && bash ~/dcos/dcos_generate_config.sh --web -v')
       end
 
       def install_push
@@ -122,7 +137,7 @@ module VagrantPlugins
         filter_machines(active_machines, machine_types, 'master').each do |name, provider|
           machine = @machine.env.machine(name, provider)
           queue.push(Proc.new do
-            machine.ui.info 'Installing DCOS (master)'
+            machine.ui.success 'Installing DCOS (master)'
             remote_sudo(machine, %Q(bash -c "curl --fail --location --silent --show-error --verbose http://boot.dcos/dcos_install.sh | bash -s -- master"))
           end)
         end
@@ -133,14 +148,14 @@ module VagrantPlugins
         filter_machines(active_machines, machine_types, 'agent-private').each do |name, provider|
           machine = @machine.env.machine(name, provider)
           queue.push(Proc.new do
-            machine.ui.info 'Installing DCOS (agent)'
+            machine.ui.success 'Installing DCOS (agent)'
             remote_sudo(machine, %Q(bash -c "curl --fail --location --silent --show-error --verbose http://boot.dcos/dcos_install.sh | bash -s -- slave"))
           end)
         end
         filter_machines(active_machines, machine_types, 'agent-public').each do |name, provider|
           machine = @machine.env.machine(name, provider)
           queue.push(Proc.new do
-            machine.ui.info 'Installing DCOS (agent-public)'
+            machine.ui.success 'Installing DCOS (agent-public)'
             remote_sudo(machine, %Q(bash -c "curl --fail --location --silent --show-error --verbose http://boot.dcos/dcos_install.sh | bash -s -- slave_public"))
           end)
         end
@@ -151,7 +166,7 @@ module VagrantPlugins
         filter_machines(active_machines, machine_types, 'master').each do |name, provider|
           machine = @machine.env.machine(name, provider)
           queue.push(Proc.new do
-            machine.ui.info 'DCOS Postflight'
+            machine.ui.success 'DCOS Postflight'
             write_postflight(machine, postflight_timeout_seconds)
             remote_sudo(machine, '/opt/mesosphere/bin/postflight.sh')
           end)
@@ -159,7 +174,7 @@ module VagrantPlugins
         filter_machines(active_machines, machine_types, 'agent-private').each do |name, provider|
           machine = @machine.env.machine(name, provider)
           queue.push(Proc.new do
-            machine.ui.info 'DCOS Postflight'
+            machine.ui.success 'DCOS Postflight'
             write_postflight(machine, postflight_timeout_seconds)
             remote_sudo(machine, '/opt/mesosphere/bin/postflight.sh')
           end)
@@ -167,7 +182,7 @@ module VagrantPlugins
         filter_machines(active_machines, machine_types, 'agent-public').each do |name, provider|
           machine = @machine.env.machine(name, provider)
           queue.push(Proc.new do
-            machine.ui.info 'DCOS Postflight'
+            machine.ui.success 'DCOS Postflight'
             write_postflight(machine, postflight_timeout_seconds)
             remote_sudo(machine, '/opt/mesosphere/bin/postflight.sh')
           end)
@@ -189,7 +204,6 @@ module VagrantPlugins
       # write config.yaml to the boot machine
       def write_gen_conf_config(gen_conf_config)
         escaped_config_yaml = gen_conf_config.to_yaml.gsub('$', '\$')
-        @machine.ui.info 'Generating ~/dcos/genconf/config.yaml'
         sudo(%Q(cat << EOF > ~/dcos/genconf/config.yaml\n#{escaped_config_yaml}\nEOF))
       end
 
@@ -204,8 +218,6 @@ echo $(/usr/sbin/ip route show to match #{master_ip} | grep -Eo '[0-9]{1,3}\.[0-
 EOF
 
         escaped_ip_config = ip_config.gsub('$', '\$')
-
-        @machine.ui.info 'Generating ~/dcos/genconf/ip-detect'
         sudo(%Q(cat << EOF > ~/dcos/genconf/ip-detect\n#{escaped_ip_config}\nEOF))
       end
 
@@ -240,7 +252,7 @@ EOF
 
         escaped_postflight = postflight.gsub('$', '\$')
 
-        machine.ui.info 'Generating /opt/mesosphere/bin/postflight.sh'
+        machine.ui.success 'Generating Postflight Script: /opt/mesosphere/bin/postflight.sh'
         remote_sudo(machine, %Q(cat << EOF > /opt/mesosphere/bin/postflight.sh\n#{escaped_postflight}\nEOF))
         remote_sudo(machine, 'chmod u+x /opt/mesosphere/bin/postflight.sh')
       end
